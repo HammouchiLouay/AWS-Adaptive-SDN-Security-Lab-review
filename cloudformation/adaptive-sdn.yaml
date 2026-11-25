@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Adaptive SDN lab: Ubuntu, Open vSwitch, OS-Ken OpenFlow 1.3 controller and 4 Linux namespaces.'
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+    - t3.small
+    - t3.medium
+    - t3.large
+    Description: Recommended t3.small or greater for OVS+controller.
+  LatestUbuntuAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+Resources:
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.60.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: sdn-lab-vpc
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId:
+        Ref: InternetGateway
+      VpcId:
+        Ref: LabVPC
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: LabVPC
+      CidrBlock: 10.60.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: sdn-lab-host-subnet
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: LabVPC
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId:
+        Ref: RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  SubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: RouteTable
+      SubnetId:
+        Ref: PublicSubnet
+  LabSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound access; SSM outbound managed only via EC2 IAM role.
+      VpcId:
+        Ref: LabVPC
+      SecurityGroupEgress:
+      - IpProtocol: '-1'
+        CidrIp: 0.0.0.0/0
+        Description: Outbound bootstrap packages and SSM
+      Tags:
+      - Key: Name
+        Value: sdn-lab-no-inbound
+  LabRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  LabProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - Ref: LabRole
+  SDNInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+    - DefaultRoute
+    - SubnetRouteAssoc
+    Properties:
+      ImageId:
+        Ref: LatestUbuntuAmi
+      InstanceType:
+        Ref: InstanceType
+      SubnetId:
+        Ref: PublicSubnet
+      SecurityGroupIds:
+      - Ref: LabSG
+      IamInstanceProfile:
+        Ref: LabProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+      - DeviceName: /dev/sda1
+        Ebs:
+          VolumeSize: 16
+          VolumeType: gp3
+          DeleteOnTermination: true
+          Encrypted: true
+      UserData:
+        Fn::Base64: "#!/bin/bash\nset -euxo pipefail\nexec > >(tee /var/log/sdn-bootstrap.log | logger -t user-data -s 2>/dev/console) 2>&1\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y openvswitch-switch python3 python3-venv python3-pip iproute2 iputils-ping curl\nmkdir -p /opt/sdn\nbase64 -d > /opt/sdn/adaptive_sdn.py <<'BASE64_ADAPTIVE_SDN'\nIiIiQWRhcHRpdmUgU0ROIGxhYiB1c2luZyBPUy1LZW4gKFJ5dS1kZXJpdmVkKSwgT3BlbkZsb3cgMS4zLgoKRm91ciBuYW1lc3BhY2VzIGJlaGluZCBvbmUgT3BlbiB2U3dpdGNoLiBObyBwcm9kdWN0aW9uIGludGVyZmFjZXMgYXR0YWNoZWQuClN0YXRpYyBob3N0LXRvLXBvcnQgaWRlbnRpdHkgcHJvdmlkZXMgZGV0ZXJtaW5pc3RpYyBzZWdtZW50YXRpb247IGEgcGVyLXBvcnQKSUNNUCB0aHJlc2hvbGQgdHJpZ2dlcnMgdGVtcG9yYXJ5IE9wZW5GbG93IHF1YXJhbnRpbmUgd2l0aCBoYXJkX3RpbWVvdXQuCiIiIgppbXBvcnQgbG9nZ2luZwppbXBvcnQgdGltZQpmcm9tIGNvbGxlY3Rpb25zIGltcG9ydCBkZWZhdWx0ZGljdCwgZGVxdWUKCmZyb20gb3Nfa2VuLmJhc2UgaW1wb3J0IGFwcF9tYW5hZ2VyCmZyb20gb3Nfa2VuLmNvbnRyb2xsZXIgaW1wb3J0IG9mcF9ldmVudApmcm9tIG9zX2tlbi5jb250cm9sbGVyLmhhbmRsZXIgaW1wb3J0IENPTkZJR19ESVNQQVRDSEVSLCBNQUlOX0RJU1BBVENIRVIsIHNldF9ldl9jbHMKZnJvbSBvc19rZW4ubGliLnBhY2tldCBpbXBvcnQgZXRoZXJuZXQsIGV0aGVyX3R5cGVzLCBpcHY0LCBwYWNrZXQKZnJvbSBvc19rZW4ub2Zwcm90byBpbXBvcnQgb2Zwcm90b192MV8zCgpMT0cgPSBsb2dnaW5nLmdldExvZ2dlcihfX25hbWVfXykKCiMgT1ZTIE9wZW5GbG93IHBvcnRzIGFzc2lnbmVkIHdpdGggb2Zwb3J0X3JlcXVlc3QgYnkgc2V0dXBfdG9wb2xvZ3kuc2guClBPUlRfU0VHTUVOVCA9IHsxOiAxMCwgMjogMTAsIDM6IDIwLCA0OiAyMH0KUE9SVF9NQUMgPSB7CiAgICAxOiAnMDI6MDA6MDA6MDA6MTA6MDEnLAogICAgMjogJzAyOjAwOjAwOjAwOjEwOjAyJywKICAgIDM6ICcwMjowMDowMDowMDoyMDowMycsCiAgICA0OiAnMDI6MDA6MDA6MDA6MjA6MDQnLAp9Ck1BQ19QT1JUID0ge21hYzogcG9ydCBmb3IgcG9ydCwgbWFjIGluIFBPUlRfTUFDLml0ZW1zKCl9CldJTkRPV19TRUNPTkRTID0gNS4wCklDTVBfTElNSVQgPSA4ICAjID44IElDTVAgc291cmNlIHBhY2tldHMgd2l0aGluIDUgc2Vjb25kcyB0cmlnZ2VycyBxdWFyYW50aW5lLgpRVUFSQU5USU5FX1NFQ09ORFMgPSAyMAoKCmNsYXNzIEFkYXB0aXZlU2VnbWVudGF0aW9uKGFwcF9tYW5hZ2VyLk9TS2VuQXBwKToKICAgIE9GUF9WRVJTSU9OUyA9IFtvZnByb3RvX3YxXzMuT0ZQX1ZFUlNJT05dCgogICAgZGVmIF9faW5pdF9fKHNlbGYsICphcmdzLCAqKmt3YXJncyk6CiAgICAgICAgc3VwZXIoKS5fX2luaXRfXygqYXJncywgKiprd2FyZ3MpCiAgICAgICAgc2VsZi5pY21wX3dpbmRvd3MgPSBkZWZhdWx0ZGljdChkZXF1ZSkKICAgICAgICBzZWxmLnF1YXJhbnRpbmVkX3VudGlsID0ge30KCiAgICBAc3RhdGljbWV0aG9kCiAgICBkZWYgaW5zdGFsbF9mbG93KGRwLCBwcmlvcml0eSwgbWF0Y2gsIGFjdGlvbnM9Tm9uZSwgaGFyZF90aW1lb3V0PTApOgogICAgICAgIHByb3RvLCBwYXJzZXIgPSBkcC5vZnByb3RvLCBkcC5vZnByb3RvX3BhcnNlcgogICAgICAgIGluc3RydWN0aW9ucyA9IChbcGFyc2VyLk9GUEluc3RydWN0aW9uQWN0aW9ucyhwcm90by5PRlBJVF9BUFBMWV9BQ1RJT05TLCBhY3Rpb25zKV0KICAgICAgICAgICAgICAgICAgICAgICAgaWYgYWN0aW9ucyBpcyBub3QgTm9uZSBlbHNlIFtdKQogICAgICAgIGRwLnNlbmRfbXNnKHBhcnNlci5PRlBGbG93TW9kKAogICAgICAgICAgICBkYXRhcGF0aD1kcCwgcHJpb3JpdHk9cHJpb3JpdHksIG1hdGNoPW1hdGNoLAogICAgICAgICAgICBpbnN0cnVjdGlvbnM9aW5zdHJ1Y3Rpb25zLCBoYXJkX3RpbWVvdXQ9aGFyZF90aW1lb3V0LAogICAgICAgICAgICBpZGxlX3RpbWVvdXQ9MCwgdGFibGVfaWQ9MCkpCgogICAgQHNldF9ldl9jbHMob2ZwX2V2ZW50LkV2ZW50T0ZQU3dpdGNoRmVhdHVyZXMsIENPTkZJR19ESVNQQVRDSEVSKQogICAgZGVmIHN3aXRjaF9yZWFkeShzZWxmLCBldik6CiAgICAgICAgZHAgPSBldi5tc2cuZGF0YXBhdGgKICAgICAgICBwID0gZHAub2Zwcm90b19wYXJzZXIKICAgICAgICBvID0gZHAub2Zwcm90bwogICAgICAgIHNlbGYuaWNtcF93aW5kb3dzLmNsZWFyKCkKICAgICAgICBzZWxmLnF1YXJhbnRpbmVkX3VudGlsLmNsZWFyKCkKICAgICAgICAjIEZhaWwgY2xvc2VkOiBvbmx5IHBhY2tldC1pbiBmb3IgZm91ciBrbm93biBhY2Nlc3MgcG9ydHMuCiAgICAgICAgc2VsZi5pbnN0YWxsX2Zsb3coZHAsIDAsIHAuT0ZQTWF0Y2goKSwgW10pCiAgICAgICAgZm9yIHBvcnQgaW4gUE9SVF9TRUdNRU5UOgogICAgICAgICAgICBzZWxmLmluc3RhbGxfZmxvdyhkcCwgMTAsIHAuT0ZQTWF0Y2goaW5fcG9ydD1wb3J0KSwgWwogICAgICAgICAgICAgICAgcC5PRlBBY3Rpb25PdXRwdXQoby5PRlBQX0NPTlRST0xMRVIsIG8uT0ZQQ01MX05PX0JVRkZFUildKQogICAgICAgIExPRy53YXJuaW5nKCdTV0lUQ0hfQ09OTkVDVEVEIGRwaWQ9JXMgT0YxLjMgY29udHJvbGxlZCBwb3J0cz0lcycsCiAgICAgICAgICAgICAgICAgICAgZHAuaWQsIHNvcnRlZChQT1JUX1NFR01FTlQpKQoKICAgIGRlZiBlbWl0X3BhY2tldChzZWxmLCBkcCwgaW5fcG9ydCwgZnJhbWUsIG91dF9wb3J0cyk6CiAgICAgICAgcGFyc2VyID0gZHAub2Zwcm90b19wYXJzZXIKICAgICAgICBhY3RzID0gW3BhcnNlci5PRlBBY3Rpb25PdXRwdXQocG9ydCkgZm9yIHBvcnQgaW4gb3V0X3BvcnRzXQogICAgICAgIGRwLnNlbmRfbXNnKHBhcnNlci5PRlBQYWNrZXRPdXQoCiAgICAgICAgICAgIGRhdGFwYXRoPWRwLCBidWZmZXJfaWQ9ZHAub2Zwcm90by5PRlBfTk9fQlVGRkVSLAogICAgICAgICAgICBpbl9wb3J0PWluX3BvcnQsIGFjdGlvbnM9YWN0cywgZGF0YT1mcmFtZSkpCgogICAgQHNldF9ldl9jbHMob2ZwX2V2ZW50LkV2ZW50T0ZQUGFja2V0SW4sIE1BSU5fRElTUEFUQ0hFUikKICAgIGRlZiBwYWNrZXRfaW4oc2VsZiwgZXYpOgogICAgICAgIG1zZyA9IGV2Lm1zZwogICAgICAgIGRwID0gbXNnLmRhdGFwYXRoCiAgICAgICAgaW5ncmVzcyA9IG1zZy5tYXRjaC5nZXQoJ2luX3BvcnQnKQogICAgICAgIGlmIGluZ3Jlc3Mgbm90IGluIFBPUlRfU0VHTUVOVDoKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgcGt0ID0gcGFja2V0LlBhY2tldChtc2cuZGF0YSkKICAgICAgICBldGggPSBwa3QuZ2V0X3Byb3RvY29sKGV0aGVybmV0LmV0aGVybmV0KQogICAgICAgIGlmIGV0aCBpcyBOb25lIG9yIGV0aC5ldGhlcnR5cGUgaW4gKGV0aGVyX3R5cGVzLkVUSF9UWVBFX0xMRFAsIGV0aGVyX3R5cGVzLkVUSF9UWVBFX0lQVjYpOgogICAgICAgICAgICByZXR1cm4KICAgICAgICBzcmMgPSBldGguc3JjLmxvd2VyKCkKICAgICAgICBpZiBQT1JUX01BQ1tpbmdyZXNzXSAhPSBzcmM6CiAgICAgICAgICAgIExPRy53YXJuaW5nKCdTUE9PRl9EUk9QIGluX3BvcnQ9JXMgbWFjPSVzJywgaW5ncmVzcywgc3JjKQogICAgICAgICAgICByZXR1cm4KICAgICAgICBub3cgPSB0aW1lLm1vbm90b25pYygpCiAgICAgICAgaWYgbm93IDwgc2VsZi5xdWFyYW50aW5lZF91bnRpbC5nZXQoaW5ncmVzcywgMCk6CiAgICAgICAgICAgIHJldHVybgogICAgICAgIGlwID0gcGt0LmdldF9wcm90b2NvbChpcHY0LmlwdjQpCiAgICAgICAgaWYgaXAgaXMgbm90IE5vbmUgYW5kIGlwLnByb3RvID09IDE6ICAjIElDTVAKICAgICAgICAgICAgcSA9IHNlbGYuaWNtcF93aW5kb3dzW2luZ3Jlc3NdCiAgICAgICAgICAgIHdoaWxlIHEgYW5kIHFbMF0gPD0gbm93IC0gV0lORE9XX1NFQ09ORFM6CiAgICAgICAgICAgICAgICBxLnBvcGxlZnQoKQogICAgICAgICAgICBxLmFwcGVuZChub3cpCiAgICAgICAgICAgIGlmIGxlbihxKSA+IElDTVBfTElNSVQ6CiAgICAgICAgICAgICAgICBzZWxmLnF1YXJhbnRpbmVkX3VudGlsW2luZ3Jlc3NdID0gbm93ICsgUVVBUkFOVElORV9TRUNPTkRTCiAgICAgICAgICAgICAgICBzZWxmLmljbXBfd2luZG93c1tpbmdyZXNzXS5jbGVhcigpCiAgICAgICAgICAgICAgICBzZWxmLmluc3RhbGxfZmxvdyhkcCwgMjAwLCBkcC5vZnByb3RvX3BhcnNlci5PRlBNYXRjaChpbl9wb3J0PWluZ3Jlc3MpLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgW10sIGhhcmRfdGltZW91dD1RVUFSQU5USU5FX1NFQ09ORFMpCiAgICAgICAgICAgICAgICBMT0cud2FybmluZygnUVVBUkFOVElORSBob3N0PVBDJWQgc2VnbWVudD0lZCBkdXJhdGlvbj0lZHMgcmVhc29uPWljbXBfdGhyZXNob2xkJywKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGluZ3Jlc3MsIFBPUlRfU0VHTUVOVFtpbmdyZXNzXSwgUVVBUkFOVElORV9TRUNPTkRTKQogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgc2VnbWVudCA9IFBPUlRfU0VHTUVOVFtpbmdyZXNzXQogICAgICAgIHRhcmdldCA9IE1BQ19QT1JULmdldChldGguZHN0Lmxvd2VyKCkpCiAgICAgICAgaWYgdGFyZ2V0IGlzIE5vbmU6CiAgICAgICAgICAgICMgQnJvYWRjYXN0L3Vua25vd24gdW5pY2FzdCBpcyBsaW1pdGVkIHRvICpzYW1lKiBzZWdtZW50LgogICAgICAgICAgICBvdXRwdXRfcG9ydHMgPSBbbiBmb3IgbiwgcyBpbiBQT1JUX1NFR01FTlQuaXRlbXMoKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgaWYgcyA9PSBzZWdtZW50IGFuZCBuICE9IGluZ3Jlc3NdCiAgICAgICAgZWxpZiBQT1JUX1NFR01FTlRbdGFyZ2V0XSA9PSBzZWdtZW50IGFuZCB0YXJnZXQgIT0gaW5ncmVzczoKICAgICAgICAgICAgb3V0cHV0X3BvcnRzID0gW3RhcmdldF0KICAgICAgICBlbHNlOgogICAgICAgICAgICBMT0cuaW5mbygnU0VHTUVOVF9EUk9QIHNyYz1QQyVkIGRlc3Q9JXMgc2VnbWVudD0lZCcsIGluZ3Jlc3MsIGV0aC5kc3QsIHNlZ21lbnQpCiAgICAgICAgICAgIHJldHVybgogICAgICAgIGlmIG91dHB1dF9wb3J0czoKICAgICAgICAgICAgc2VsZi5lbWl0X3BhY2tldChkcCwgaW5ncmVzcywgbXNnLmRhdGEsIG91dHB1dF9wb3J0cykK\n\
+          BASE64_ADAPTIVE_SDN\nbase64 -d > /opt/sdn/setup_topology.sh <<'BASE64_SETUP_TOPOLOGY'\nIyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbApCUj1ici1zZG4KIyBFbnN1cmUgY29udHJvbGxlciBpcyBydW5uaW5nIGZpcnN0OiBicmlkZ2UgaGFzIHNlY3VyZSBmYWlsIG1vZGUgKGZhaWwtY2xvc2VkKS4Kc3lzdGVtY3RsIGlzLWFjdGl2ZSAtLXF1aWV0IHNkbi1jb250cm9sbGVyCm92cy12c2N0bCAtLWlmLWV4aXN0cyBkZWwtYnIgIiRCUiIKZm9yIGlkIGluIDEgMiAzIDQ7IGRvIGlwIG5ldG5zIGRlbCAicGMkaWQiIDI+L2Rldi9udWxsIHx8IHRydWU7IGRvbmUKb3ZzLXZzY3RsIGFkZC1iciAiJEJSIgpvdnMtdnNjdGwgc2V0IGJyaWRnZSAiJEJSIiBwcm90b2NvbHM9T3BlbkZsb3cxMwpvdnMtdnNjdGwgc2V0LWZhaWwtbW9kZSAiJEJSIiBzZWN1cmUKb3ZzLXZzY3RsIHNldC1jb250cm9sbGVyICIkQlIiIHRjcDoxMjcuMC4wLjE6NjY1Mwpmb3IgaWQgaW4gMSAyIDMgNDsgZG8KICBpZiBbWyAiJGlkIiAtbGUgMiBdXTsgdGhlbiBzZWdtZW50PTEwOyBlbHNlIHNlZ21lbnQ9MjA7IGZpCiAgaXAgbmV0bnMgYWRkICJwYyRpZCIKICBpcCBsaW5rIGFkZCAidmV0aCRpZCIgdHlwZSB2ZXRoIHBlZXIgbmFtZSAiZXRoMCIgbmV0bnMgInBjJGlkIgogIGlwIGxpbmsgc2V0ICJ2ZXRoJGlkIiB1cAogIGlwIC1uICJwYyRpZCIgbGluayBzZXQgbG8gdXAKICBpcCAtbiAicGMkaWQiIGxpbmsgc2V0IGV0aDAgYWRkcmVzcyAiJChwcmludGYgJzAyOjAwOjAwOjAwOiUwMmQ6JTAyZCcgIiRzZWdtZW50IiAiJGlkIikiCiAgaXAgLW4gInBjJGlkIiBhZGRyIGFkZCAiMTkyLjE2OC4kc2VnbWVudC4kaWQvMjQiIGRldiBldGgwCiAgaXAgLW4gInBjJGlkIiBsaW5rIHNldCBldGgwIHVwCiAgb3ZzLXZzY3RsIGFkZC1wb3J0ICIkQlIiICJ2ZXRoJGlkIiAtLSBzZXQgSW50ZXJmYWNlICJ2ZXRoJGlkIiBvZnBvcnRfcmVxdWVzdD0iJGlkIgpkb25lCiMgRGVsaWJlcmF0ZSBkaXJlY3Qgcm91dGVzIGFuZCBzdGF0aWMgbmVpZ2hib3IgZW50cmllcyBsZXQgdXMgdGVzdCBhbiBhY3R1YWwKIyBjcm9zcy1zZWdtZW50IE9wZW5GbG93IERFTlkgaW5zdGVhZCBvZiBtZXJlbHkgcmVseWluZyBvbiBhYnNlbnQgTDMgcm91dGVzLgppcCAtbiBwYzEgcm91dGUgYWRkIDE5Mi4xNjguMjAuMy8zMiBkZXYgZXRoMAppcCAtbiBwYzEgbmVpZ2ggcmVwbGFjZSAxOTIuMTY4LjIwLjMgbGxhZGRyIDAyOjAwOjAwOjAwOjIwOjAzIGRldiBldGgwIG51ZCBwZXJtYW5lbnQKaXAgLW4gcGMzIHJvdXRlIGFkZCAxOTIuMTY4LjEwLjEvMzIgZGV2IGV0aDAKaXAgLW4gcGMzIG5laWdoIHJlcGxhY2UgMTkyLjE2OC4xMC4xIGxsYWRkciAwMjowMDowMDowMDoxMDowMSBkZXYgZXRoMCBudWQgcGVybWFuZW50CiMgVkxBTi1saWtlIHNlZ21lbnRhdGlvbiBpcyBlbmZvcmNlZCBieSB0aGUgY29udHJvbGxlcidzIGFsbG93ZWQgcG9ydCBncm91cHM7CiMgdGhlc2UgbmFtZXNwYWNlcyBoYXZlIG5vIElQIHJvdXRlIHRvIHRoZSBob3N0IEVDMiBuZXR3b3JrLgplY2hvICdUb3BvbG9neSByZWFkeTogcGMxL3BjMiBzZWdtZW50MTA7IHBjMy9wYzQgc2VnbWVudDIwLicKb3ZzLXZzY3RsIHNob3cK\n\
+          BASE64_SETUP_TOPOLOGY\nbase64 -d > /opt/sdn/run_tests.sh <<'BASE64_RUN_TESTS'\nIyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLXVvIHBpcGVmYWlsCnByaW50ZiAnXG49PT0gU0ROIGhlYWx0aCA9PT1cbicKc3lzdGVtY3RsIC0tbm8tcGFnZXIgLS1mdWxsIHN0YXR1cyBzZG4tY29udHJvbGxlciB8IGhlYWQgLTE4IHx8IHRydWUKb3ZzLXZzY3RsIGdldC1jb250cm9sbGVyIGJyLXNkbgpvdnMtdnNjdGwgZ2V0IGJyaWRnZSBici1zZG4gcHJvdG9jb2xzCm92cy1vZmN0bCAtTyBPcGVuRmxvdzEzIGR1bXAtZmxvd3MgYnItc2RuCnByaW50ZiAnXG49PT0gU2FtZSBzZWdtZW50IChleHBlY3RlZCBzdWNjZXNzKSA9PT1cbicKaXAgbmV0bnMgZXhlYyBwYzEgcGluZyAtYyAyIC1XIDIgMTkyLjE2OC4xMC4yCmlwIG5ldG5zIGV4ZWMgcGMzIHBpbmcgLWMgMiAtVyAyIDE5Mi4xNjguMjAuNApwcmludGYgJ1xuPT09IENyb3NzIHNlZ21lbnQgKGV4cGVjdGVkIGZhaWw7IGNvbnRyb2xsZXIgREVOWSkgPT09XG4nCmlmIGlwIG5ldG5zIGV4ZWMgcGMxIHBpbmcgLWMgMiAtVyAxIDE5Mi4xNjguMjAuMzsgdGhlbgogIGVjaG8gJ1VORVhQRUNURUQ6IGNyb3NzLXNlZ21lbnQgcGluZyBzdWNjZWVkZWQnOyBleGl0IDEKZWxzZQogIGVjaG8gJ1BBU1M6IGNyb3NzLXNlZ21lbnQgcGluZyBibG9ja2VkJwpmaQpwcmludGYgJ1xuPT09IEFkYXB0aXZlIElDTVAgcXVhcmFudGluZTogUEMxID09PVxuJwojIDEyIElDTVAgcHJvYmVzIGRlbGliZXJhdGVseSBleGNlZWQgOC1pbi01cyB0aHJlc2hvbGQuCmlwIG5ldG5zIGV4ZWMgcGMxIHBpbmcgLWMgMTIgLWkgMC4yIC1XIDEgMTkyLjE2OC4xMC4yIHx8IHRydWUKcHJpbnRmICdcbj09PSBPcGVuRmxvdyBxdWFyYW50aW5lIHJ1bGUgKHByaW9yaXR5PTIwMCwgaGFyZF90aW1lb3V0PTIwKSA9PT1cbicKb3ZzLW9mY3RsIC1PIE9wZW5GbG93MTMgZHVtcC1mbG93cyBici1zZG4gfCBncmVwIC1FICdwcmlvcml0eT0yMDB8cHJpb3JpdHk9MTAnIHx8IHRydWUKcHJpbnRmICdcbj09PSBDb250cm9sbGVyIGV2aWRlbmNlID09PVxuJwpqb3VybmFsY3RsIC11IHNkbi1jb250cm9sbGVyIC1uIDQwIC0tbm8tcGFnZXIgfCBncmVwIC1FICdRVUFSQU5USU5FfFNXSVRDSF9DT05ORUNURUR8U0VHTUVOVF9EUk9QfFNQT09GX0RST1AnIHx8IHRydWUKcHJpbnRmICdcbkFmdGVyIH4yMCBzZWNvbmRzLCByZXJ1biBub3JtYWwgc2FtZS1zZWdtZW50IHBpbmcgdG8gdmVyaWZ5IHJlY292ZXJ5LlxuJwo=\n\
+          BASE64_RUN_TESTS\nbase64 -d > /opt/sdn/verify_recovery.sh <<'BASE64_VERIFY_RECOVERY'\nIyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1byBwaXBlZmFpbApwcmludGYgJ1Rlc3RpbmcgUEMxIHRvIFBDMiBhZnRlciBxdWFyYW50aW5lIGV4cGlyeS4uLlxuJwppcCBuZXRucyBleGVjIHBjMSBwaW5nIC1jIDIgLVcgMiAxOTIuMTY4LjEwLjIKcHJpbnRmICdcbkFjdGl2ZSBPcGVuRmxvdyBmbG93czpcbicKb3ZzLW9mY3RsIC1PIE9wZW5GbG93MTMgZHVtcC1mbG93cyBici1zZG4K\nBASE64_VERIFY_RECOVERY\nchmod +x /opt/sdn/*.sh\npython3 -m venv /opt/sdn/venv\n/opt/sdn/venv/bin/pip install --disable-pip-version-check 'os-ken==4.2.2'\nsystemctl enable --now openvswitch-switch\ncat >/etc/systemd/system/sdn-controller.service <<'UNIT'\n[Unit]\nDescription=Adaptive SDN OpenFlow 1.3 controller (OS-Ken)\nAfter=network-online.target openvswitch-switch.service\nWants=network-online.target\nRequires=openvswitch-switch.service\n[Service]\nType=simple\nWorkingDirectory=/opt/sdn\nExecStart=/opt/sdn/venv/bin/osken-manager --ofp-listen-host 127.0.0.1 --ofp-tcp-listen-port 6653 --verbose /opt/sdn/adaptive_sdn.py\n\
+          Restart=always\nRestartSec=3\nStandardOutput=journal\nStandardError=journal\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now sdn-controller\n# systemd can report active before the controller socket is ready.\nfor i in $(seq 1 30); do\n  if bash -c 'echo >/dev/tcp/127.0.0.1/6653' 2>/dev/null; then break; fi\n  sleep 2\ndone\n/opt/sdn/setup_topology.sh\necho 'SDN_SETUP_COMPLETE' >/opt/sdn/installation-status\n"
+      Tags:
+      - Key: Name
+        Value: adaptive-sdn-controller-ovs-lab
+Outputs:
+  InstanceId:
+    Description: Open EC2 instance and connect using Session Manager.
+    Value:
+      Ref: SDNInstance
+  VPC:
+    Value:
+      Ref: LabVPC
+  AccessNote:
+    Value: EC2 > Instances > Connect > Session Manager; then sudo /opt/sdn/run_tests.sh
